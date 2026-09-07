@@ -1,0 +1,21 @@
+Mean Scores Per Category:
+          llm_score  count
+category                  
+EASY         0.6000     15
+HARD         0.6364     11
+MEDIUM       0.9286     14
+
+Overall Mean Scores:
+llm_score    0.725
+dtype: float64
+
+--------------------------------
+Tools Overall Accuracy:
+Tool: MemMachineAgent
+  Accuracy: 17/26 = 65.38%
+Tool: SplitQueryAgent
+  Accuracy: 1/1 = 100.00%
+Tool: ChainOfQueryAgent
+  Accuracy: 11/13 = 84.62%
+
+--------------------------------
