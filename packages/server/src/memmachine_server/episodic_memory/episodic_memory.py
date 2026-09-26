@@ -21,7 +21,7 @@ import logging
 import time
 from collections.abc import Coroutine, Iterable
 from enum import StrEnum
-from typing import cast, get_args
+from typing import cast, get_args, Any
 
 from pydantic import BaseModel, Field, InstanceOf, model_validator
 
@@ -79,6 +79,12 @@ class EpisodicMemoryParams(BaseModel):
         default=True,
         description="Whether the episodic memory is enabled",
     )
+    # Procedural memory tier (optional). When set, trajectories are also
+    # ingested into the Neo4j procedure graph alongside STM and LTM.
+    procedural_graph_store: Any | None = Field(
+        default=None,
+        description="Optional ProceduralGraphStore for the procedural memory tier",
+    )
 
     @model_validator(mode="after")
     def validate_memory_params(self) -> "EpisodicMemoryParams":
@@ -120,6 +126,7 @@ class EpisodicMemory:
 
         self._short_term_memory: ShortTermMemory | None = params.short_term_memory
         self._long_term_memory: LongTermMemory | None = params.long_term_memory
+        self._procedural_graph_store = params.procedural_graph_store
 
         self._enabled = params.enabled
         if not self._enabled:
@@ -233,6 +240,13 @@ class EpisodicMemory:
             tasks.append(self._short_term_memory.add_episodes(episodes))
         if self._long_term_memory:
             tasks.append(self._long_term_memory.add_episodes(episodes))
+        # Procedural memory tier: ingest episodes into the procedure graph
+        # alongside STM and LTM. The procedural_graph_store handles its own
+        # extraction logic (parsing tool names, building graph edges).
+        if self._procedural_graph_store is not None:
+            tasks.append(
+                self._ingest_to_procedural_graph(episodes)
+            )
         await asyncio.gather(
             *tasks,
         )
@@ -240,6 +254,91 @@ class EpisodicMemory:
         delta = (end_time - start_time) / 1000000
         self._ingestion_latency_summary.observe(delta)
         self._ingestion_counter.increment()
+
+    async def _ingest_to_procedural_graph(self, episodes: list[Episode]) -> None:
+        """Ingest episodes into the procedural memory graph.
+
+        Extracts tool-call structure from episode content and builds the
+        procedure graph in Neo4j. Episodes with [STATE] and [ACTION] markers
+        (from benchmark trajectories) are parsed into tool nodes and edges.
+
+        This runs concurrently with STM and LTM ingestion via asyncio.gather
+        in add_memory_episodes().
+        """
+        if self._procedural_graph_store is None:
+            return
+
+        try:
+            # Group episodes by trajectory_id from metadata
+            trajectory_episodes: dict[str, list[Episode]] = {}
+            for ep in episodes:
+                tid = (ep.metadata or {}).get("trajectory_id", "")
+                if tid:
+                    trajectory_episodes.setdefault(tid, []).append(ep)
+
+            if not trajectory_episodes:
+                return
+
+            for tid, traj_episodes in trajectory_episodes.items():
+                # Convert episodes to action dicts for graph_store
+                actions = []
+                for ep in sorted(traj_episodes, key=lambda e: (e.metadata or {}).get("step_id", 0)):
+                    content = ep.content or ""
+                    metadata = ep.metadata or {}
+
+                    # Skip non-action episodes (task descriptions, etc.)
+                    if "[ACTION]" not in content and "[STATE]" not in content:
+                        continue
+
+                    # Extract state and action from episode content
+                    state_desc = ""
+                    action_text = ""
+                    if "[STATE]" in content:
+                        parts = content.split("[ACTION]", 1)
+                        state_desc = parts[0].replace("[STATE]", "").strip()
+                        if len(parts) > 1:
+                            action_text = parts[1].strip()
+                    elif "[ACTION]" in content:
+                        action_text = content.replace("[ACTION]", "").strip()
+
+                    if not action_text:
+                        continue
+
+                    # Parse tool name from action text (reuse extractor logic)
+                    from memmachine_server.procedural_memory.procedure_extractor import (
+                        ProcedureExtractor,
+                    )
+                    tool_name, params = ProcedureExtractor._parse_alfworld_action(
+                        action_text
+                    )
+
+                    actions.append({
+                        "tool_name": tool_name,
+                        "parameters": params,
+                        "step_id": metadata.get("step_id", 0),
+                        "state_description": state_desc,
+                    })
+
+                if actions:
+                    # Determine success from metadata (default True for benchmark data)
+                    success = traj_episodes[0].metadata.get("success", True) if traj_episodes[0].metadata else True
+                    task_desc = ""
+                    for ep in traj_episodes:
+                        if ep.content and "[TASK]" in ep.content:
+                            task_desc = ep.content.replace("[TASK]", "").strip()
+                            break
+
+                    await self._procedural_graph_store.ingest_trajectory(
+                        trajectory_id=tid,
+                        task_description=task_desc,
+                        success=success,
+                        actions=actions,
+                        source=(ep.metadata or {}).get("benchmark", "unknown"),
+                    )
+
+        except Exception:
+            # Procedural ingestion should never block episodic ingestion
+            logger.exception("Procedural graph ingestion failed (non-blocking)")
 
     async def close(self) -> None:
         """
