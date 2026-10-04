@@ -99,6 +99,16 @@ from memmachine_server.server.api_v2.service import (
 logger = logging.getLogger(__name__)
 
 
+from pydantic import BaseModel
+
+
+class IngestSessionSpec(BaseModel):
+    """Request body for POST /procedural/ingest-session."""
+    org_id: str
+    project_id: str
+    session_id: str  # The run_id / session key to reconstruct from LTM
+
+
 router = APIRouter()
 
 
@@ -1101,6 +1111,35 @@ async def health_check() -> dict[str, str]:
         "service": "memmachine",
         "version": get_version().server_version,
     }
+
+
+@router.post(
+    "/procedural/ingest-session",
+    tags=["Procedural Memory"],
+    summary="Ingest a completed session into procedural memory",
+    description=(
+        "Reconstructs the full episode sequence for a session from LTM, "
+        "uses an LLM to detect and extract procedure steps, ingests the result "
+        "into the Neo4j procedure graph, and runs Louvain community detection. "
+        "Call this at session end from the agent framework's session-close hook."
+    ),
+)
+async def ingest_session_to_procedural_memory(
+    spec: IngestSessionSpec,
+    memmachine: Annotated[MemMachine, Depends(get_memmachine)],
+) -> dict:
+    """Trigger procedural memory ingestion for a completed session."""
+    try:
+        ingested = await memmachine.ingest_session_to_procedural_graph(
+            session_data=_SessionData(
+                org_id=spec.org_id,
+                project_id=spec.project_id,
+            ),
+            session_id=spec.session_id,
+        )
+        return {"ingested": ingested, "session_id": spec.session_id}
+    except Exception as e:
+        raise RestError(code=500, message="Procedural ingestion failed", ex=e) from e
 
 
 def load_v2_api_router(app: FastAPI, *, with_config_api: bool = False) -> APIRouter:

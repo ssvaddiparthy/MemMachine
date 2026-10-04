@@ -21,7 +21,7 @@ import logging
 import time
 from collections.abc import Coroutine, Iterable
 from enum import StrEnum
-from typing import cast, get_args
+from typing import cast, get_args, Any
 
 from pydantic import BaseModel, Field, InstanceOf, model_validator
 
@@ -79,6 +79,18 @@ class EpisodicMemoryParams(BaseModel):
         default=True,
         description="Whether the episodic memory is enabled",
     )
+    # Procedural memory tier (optional). When set, trajectories are also
+    # ingested into the Neo4j procedure graph alongside STM and LTM.
+    procedural_graph_store: Any | None = Field(
+        default=None,
+        description="Optional ProceduralGraphStore for the procedural memory tier",
+    )
+    # LLM client for LLM-based procedure extraction (Instructor-wrapped Bedrock
+    # or any client with a .chat.completions.create() interface).
+    procedural_llm: Any | None = Field(
+        default=None,
+        description="LLM client passed to ProcedureExtractor for session-level extraction",
+    )
 
     @model_validator(mode="after")
     def validate_memory_params(self) -> "EpisodicMemoryParams":
@@ -120,6 +132,8 @@ class EpisodicMemory:
 
         self._short_term_memory: ShortTermMemory | None = params.short_term_memory
         self._long_term_memory: LongTermMemory | None = params.long_term_memory
+        self._procedural_graph_store = params.procedural_graph_store
+        self._procedural_llm = params.procedural_llm
 
         self._enabled = params.enabled
         if not self._enabled:
@@ -233,6 +247,11 @@ class EpisodicMemory:
             tasks.append(self._short_term_memory.add_episodes(episodes))
         if self._long_term_memory:
             tasks.append(self._long_term_memory.add_episodes(episodes))
+        # NOTE: procedural memory ingestion is NOT triggered here per-batch.
+        # Procedures span full sessions, not individual episode batches.
+        # Call ingest_session_to_procedural_graph(session_id) explicitly at
+        # session end (e.g. from the POST /procedural/ingest-session endpoint
+        # triggered by the agent framework's session-close hook).
         await asyncio.gather(
             *tasks,
         )
@@ -240,6 +259,88 @@ class EpisodicMemory:
         delta = (end_time - start_time) / 1000000
         self._ingestion_latency_summary.observe(delta)
         self._ingestion_counter.increment()
+
+    async def ingest_session_to_procedural_graph(self, session_id: str) -> bool:
+        """Ingest a completed session into the procedural memory graph.
+
+        Reconstructs the full episode sequence for `session_id` from LTM
+        (ordered by created_at, no eviction risk), passes it to the LLM-based
+        ProcedureExtractor to detect and extract procedure steps, then ingests
+        the result into Neo4j.
+
+        Called explicitly at session end -- NOT during add_memory_episodes().
+        Triggered via POST /api/v2/procedural/ingest-session from the agent
+        framework's session-close hook (e.g. OpenClaw agent_end).
+
+        Args:
+            session_id: The run_id / session key whose episodes to process.
+
+        Returns:
+            True if a procedure was found and ingested, False otherwise.
+        """
+        if self._procedural_graph_store is None:
+            logger.debug("ingest_session_to_procedural_graph: no graph store configured")
+            return False
+
+        if self._long_term_memory is None:
+            logger.debug("ingest_session_to_procedural_graph: no LTM configured")
+            return False
+
+        try:
+            from memmachine_server.procedural_memory.procedure_extractor import (
+                ProcedureExtractor,
+            )
+            from memmachine_server.common.filter.filter_parser import parse_filter
+
+            # Reconstruct full trajectory from LTM by filtering on run_id.
+            # LTM stores raw episodes verbatim with no eviction -- safe source
+            # for full trajectory reconstruction regardless of session length.
+            filter_expr = parse_filter(f"metadata.run_id = '{session_id}'")
+            episodes = await self._long_term_memory.search_scored(
+                query="",
+                num_episodes_limit=1000,
+                property_filter=filter_expr,
+            )
+
+            if not episodes:
+                logger.debug(
+                    "ingest_session_to_procedural_graph: no episodes found for session %s",
+                    session_id,
+                )
+                return False
+
+            # Sort by created_at to reconstruct temporal order
+            ordered = sorted(
+                episodes,
+                key=lambda e: e.created_at if hasattr(e, "created_at") and e.created_at else "",
+            )
+
+            extractor = ProcedureExtractor(
+                graph_store=self._procedural_graph_store,
+                llm=self._procedural_llm,
+            )
+            meta = await extractor.extract_from_session_episodes(
+                session_id=session_id,
+                episodes=ordered,
+            )
+
+            if meta is None or not meta.success:
+                return False
+
+            logger.info(
+                "ingest_session_to_procedural_graph: ingested procedure for session %s "
+                "(%d steps, goal: %s)",
+                session_id, meta.total_steps, meta.task_description,
+            )
+
+            return True
+
+        except Exception:
+            logger.exception(
+                "ingest_session_to_procedural_graph: failed for session %s (non-blocking)",
+                session_id,
+            )
+            return False
 
     async def close(self) -> None:
         """

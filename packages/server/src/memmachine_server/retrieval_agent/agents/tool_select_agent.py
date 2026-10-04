@@ -100,6 +100,7 @@ class ToolSelectAgent(AgentToolBase):
         self._coq_agent: AgentToolBase | None = None
         self._split_agent: AgentToolBase | None = None
         self._memory_agent: AgentToolBase | None = None
+        self._procedural_agent: AgentToolBase | None = None
         for tool in self._children_tools:
             if tool.agent_name == "ChainOfQueryAgent":
                 self._coq_agent = tool
@@ -107,6 +108,8 @@ class ToolSelectAgent(AgentToolBase):
                 self._split_agent = tool
             elif tool.agent_name == "MemMachineAgent":
                 self._memory_agent = tool
+            elif tool.agent_name == "ProceduralAgent":
+                self._procedural_agent = tool
             if tool.agent_name == default_tool_name:
                 self._default_tool = tool
         if (
@@ -149,6 +152,23 @@ class ToolSelectAgent(AgentToolBase):
         assert self._coq_agent is not None
         assert self._split_agent is not None
         assert self._memory_agent is not None
+
+        # Procedural-first heuristic: if a ProceduralAgent is available and
+        # the query looks like a procedural "how-to" request, route directly
+        # to it without spending an LLM call on tool selection.
+        if self._procedural_agent is not None:
+            query_lower = query.query.lower()
+            procedural_signals = [
+                "how to", "how do i", "how can i", "steps to",
+                "procedure for", "what steps", "workflow for",
+            ]
+            if any(signal in query_lower for signal in procedural_signals):
+                logger.info(
+                    "ToolSelectAgent: procedural heuristic matched, "
+                    "routing to ProceduralAgent"
+                )
+                return self._procedural_agent, 0, 0
+
         prompt = self._tool_select_prompt.format(
             query=query.query,
             coq=self._coq_agent.agent_name,
@@ -191,7 +211,29 @@ class ToolSelectAgent(AgentToolBase):
             else:
                 raise RuntimeError("No tool selected")
         chunks, perf_metrics = await tool.do_query(policy, query)
-        perf_metrics["selected_tool"] = tool.agent_name
+
+        # Fallback: if the selected tool returned no results and a
+        # ProceduralAgent is available, try procedural composition.
+        if (
+            not chunks
+            and self._procedural_agent is not None
+            and tool.agent_name != "ProceduralAgent"
+        ):
+            logger.info(
+                "ToolSelectAgent: %s returned 0 results, trying ProceduralAgent fallback",
+                tool.agent_name,
+            )
+            proc_chunks, proc_metrics = await self._procedural_agent.do_query(
+                policy, query
+            )
+            if proc_chunks:
+                chunks = proc_chunks
+                perf_metrics.update(proc_metrics)
+                perf_metrics["selected_tool"] = "ProceduralAgent (fallback)"
+
+        perf_metrics["selected_tool"] = perf_metrics.get(
+            "selected_tool", tool.agent_name
+        )
         perf_metrics["tool_select_input_token"] = input_token
         perf_metrics["tool_select_output_token"] = output_token
         return chunks, perf_metrics

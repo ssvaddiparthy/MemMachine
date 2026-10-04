@@ -1159,6 +1159,34 @@ class MemMachine:
             filter_expr=combined_filter,
         )
 
+    async def ingest_session_to_procedural_graph(
+        self,
+        session_data: InstanceOf[SessionData],
+        session_id: str,
+    ) -> bool:
+        """Ingest a completed session into procedural memory.
+
+        Looks up the EpisodicMemory instance for `session_data`, then
+        delegates to EpisodicMemory.ingest_session_to_procedural_graph()
+        which reconstructs the full trajectory from LTM and runs the
+        LLM-based procedure extractor.
+
+        Args:
+            session_data: Identifies the org/project.
+            session_id: The run_id of the session to process.
+
+        Returns:
+            True if a procedure was found and ingested, False otherwise.
+        """
+        episodic_memory = await self._get_episodic_memory(session_data)
+        if episodic_memory is None:
+            logger.debug(
+                "ingest_session_to_procedural_graph: no episodic memory for %s",
+                session_data.session_key,
+            )
+            return False
+        return await episodic_memory.ingest_session_to_procedural_graph(session_id)
+
     async def delete_episodes(
         self,
         episode_ids: list[EpisodeIdT],
